@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -6,15 +7,18 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.ObjectPool;
+using Microsoft.VisualBasic;
 using Nethermind.Api;
 using Nethermind.Blockchain;
 using Nethermind.Blockchain.Receipts;
 using Nethermind.Core;
 using Nethermind.Core.Crypto;
 using Nethermind.Core.Events;
+using Nethermind.Core.Extensions;
 using Nethermind.Db;
 using Nethermind.Int256;
 using Nethermind.Logging;
@@ -50,7 +54,7 @@ namespace Nethermind.Init.Steps.Migrations
         private readonly IDb _receiptsBlockDb;
         private readonly IReceiptsRecovery _recovery;
 
-        private readonly string rootDirectory = @"C:\Users\merto\Programming\customIndexOLD2";
+        private readonly string rootDirectory = @"C:\Users\merto\Programming\Nethermind\customIndexLukasczFINAL";
         private readonly ConcurrentDictionary<Hash256AsKey, HashSet<int>> topicDictionary = new ConcurrentDictionary<Hash256AsKey, HashSet<int>>();
         private readonly ConcurrentDictionary<AddressAsKey, HashSet<int>> addressDictionary = new ConcurrentDictionary<AddressAsKey, HashSet<int>>();
         private readonly ConcurrentDictionary<string, object> fileLocks = new ConcurrentDictionary<string, object>();
@@ -98,7 +102,9 @@ namespace Nethermind.Init.Steps.Migrations
             _recovery = recovery;
             _logger = logManager.GetClassLogger();
 
+            _logger.Info("Initializing directories for migration.");
             InitializeDirectories();
+            _logger.Info("Finished initializing directories for migration.");
         }
 
         private void InitializeDirectories()
@@ -106,12 +112,26 @@ namespace Nethermind.Init.Steps.Migrations
             // Create root directory if it doesn't exist
             Directory.CreateDirectory(rootDirectory);
 
-            // Create subdirectories for 0-9, a-z, A-Z
-            foreach (char c in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            // Create subdirectories for the first three characters 0-9, a-z
+            foreach (char c1 in "0123456789abcdefghijklmnopqrstuvwxyz")
             {
-                Directory.CreateDirectory(Path.Combine(rootDirectory, c.ToString()));
+                string subfolder1 = Path.Combine(rootDirectory, c1.ToString());
+                Directory.CreateDirectory(subfolder1);
+
+                foreach (char c2 in "0123456789abcdefghijklmnopqrstuvwxyz")
+                {
+                    string subfolder2 = Path.Combine(subfolder1, c2.ToString());
+                    Directory.CreateDirectory(subfolder2);
+
+                    foreach (char c3 in "0123456789abcdefghijklmnopqrstuvwxyz")
+                    {
+                        string subfolder3 = Path.Combine(subfolder2, c3.ToString());
+                        Directory.CreateDirectory(subfolder3);
+                    }
+                }
             }
         }
+
 
         public async Task<bool> Run(long blockNumber)
         {
@@ -134,6 +154,7 @@ namespace Nethermind.Init.Steps.Migrations
             {
                 if (!CanMigrate(_syncModeSelector.Current))
                 {
+                    _logger.Info($"Waiting for {nameof(SyncModeChangedEventArgs)} to finish.");
                     await Wait.ForEventCondition<SyncModeChangedEventArgs>(
                         cancellationToken,
                         (e) => _syncModeSelector.Changed += e,
@@ -141,11 +162,13 @@ namespace Nethermind.Init.Steps.Migrations
                         (arg) => CanMigrate(arg.Current));
                 }
 
+                _logger.Info($"Finished waiting for {nameof(SyncModeChangedEventArgs)}");
+
                 RunIfNeeded(cancellationToken);
             }
         }
 
-        private static bool CanMigrate(SyncMode syncMode) => syncMode.NotSyncing();
+        private static bool CanMigrate(SyncMode syncMode) => true;
 
         private void RunIfNeeded(CancellationToken cancellationToken)
         {
@@ -172,6 +195,9 @@ namespace Nethermind.Init.Steps.Migrations
                 if (_logger.IsInfo) _logger.Info($"KeyValueMigration in progress. TotalBlocks: {totalBlocks}. Synced: {blocksProccessed}. Blocks left: {totalBlocks - blocksProccessed}");
             };
 
+            Dictionary<Hash256AsKey, WriterInfo> topicWriters = new();
+            Dictionary<AddressAsKey, WriterInfo> addressWriters = new();
+
             try
             {
                 int parallelism = _receiptConfig.ReceiptsMigrationDegreeOfParallelism;
@@ -180,31 +206,66 @@ namespace Nethermind.Init.Steps.Migrations
                     parallelism = Environment.ProcessorCount;
                 }
 
-                GetBlockBodiesForMigration(token).AsParallel().AsOrdered().WithDegreeOfParallelism(parallelism).ForAll((item) =>
+                Span<byte> buffer = stackalloc byte[sizeof(int)];
+
+                foreach ((long, TxReceipt[]) block in GetBlockBodiesForMigration(token)
+                             .Select(i => _blockTree.FindBlock(i.Item2, BlockTreeLookupOptions.None) ?? GetMissingBlock(i.Item1, i.Item2))
+                             .Select(b => (b.Number, _receiptStorage.Get(b)))
+                        )
                 {
-                    (long blockNum, Hash256 blockHash) = item;
-                    Block? block = _blockTree.FindBlock(blockHash!, BlockTreeLookupOptions.None);
-                    bool usingEmptyBlock = block is null;
-                    if (usingEmptyBlock)
+                    int blockNumber = (int)block.Item1;
+                    BinaryPrimitives.WriteInt32LittleEndian(buffer, blockNumber);
+                    foreach (TxReceipt? receipt in block.Item2)
                     {
-                        block = GetMissingBlock(blockNum, blockHash);
+                        if (receipt is { Logs: not null })
+                        {
+                            foreach (LogEntry log in receipt.Logs)
+                            {
+                                AddressAsKey key = log.LoggersAddress;
+
+                                ref WriterInfo? writer = ref CollectionsMarshal.GetValueRefOrAddDefault(addressWriters, key, out bool exists);
+
+                                if (!exists || writer is null)
+                                {
+                                    var fileStream = new FileStream(GetPath(key.Value.Bytes), FileMode.Append, FileAccess.Write, FileShare.Read);
+                                    writer = new WriterInfo(fileStream);
+                                }
+
+                                if (writer.BlockNumber < blockNumber)
+                                {
+                                    writer.Writer.Write(buffer);
+                                    writer.BlockNumber = blockNumber;
+                                }
+
+                                foreach (Hash256AsKey topic in log.Topics)
+                                {
+                                    ref WriterInfo? topicWriter = ref CollectionsMarshal.GetValueRefOrAddDefault(topicWriters, topic, out bool topicExists);
+                                    if (!topicExists || topicWriter is null)
+                                    {
+                                        var fileStream = new FileStream(GetPath(topic.Value.Bytes), FileMode.Append, FileAccess.Write, FileShare.Read);
+                                        topicWriter = new WriterInfo(fileStream);
+                                    }
+
+                                    if (topicWriter.BlockNumber < blockNumber)
+                                    {
+                                        topicWriter.Writer.Write(buffer);
+                                        topicWriter.BlockNumber = blockNumber;
+                                    }
+                                }
+                            }
+
+                            if (topicDictionary.Count + addressDictionary.Count > 10_000)
+                            {
+                                CloseFiles(topicWriters, addressWriters);
+                            }
+                        }
                     }
-
-
-
-                    ExtractKeyValuePairs(block!);
-
-                    if (usingEmptyBlock)
-                    {
-                        ReturnMissingBlock(block!);
-                    }
-
-                    Interlocked.Increment(ref blocksProccessed);
-                });
-
+                    blocksProccessed++;
+                }
             }
             finally
             {
+                CloseFiles(topicWriters, addressWriters);
                 _progress.MarkEnd();
                 _stopwatch?.Stop();
                 timer.Stop();
@@ -214,6 +275,23 @@ namespace Nethermind.Init.Steps.Migrations
             {
                 if (_logger.IsInfo) _logger.Info("KeyValueMigration finished");
             }
+        }
+
+        private void CloseFiles(
+            Dictionary<Hash256AsKey, WriterInfo> topicWriters,
+            Dictionary<AddressAsKey, WriterInfo> addressWriters)
+        {
+            _logger.Info("Disposing & Closing Files");
+            Parallel.ForEach(topicWriters.Values, info => info.Writer.Dispose());
+            Parallel.ForEach(addressWriters.Values, info => info.Writer.Dispose());
+            topicWriters.Clear();
+            addressWriters.Clear();
+        }
+
+        private class WriterInfo(Stream writer)
+        {
+            public Stream Writer { get; } = writer;
+            public int BlockNumber { get; set; }
         }
 
         private void ExtractKeyValuePairs(Block block)
@@ -271,32 +349,46 @@ namespace Nethermind.Init.Steps.Migrations
             }
         }
 
-        //private void WriteBatchToFile()
-        //{
-        //    foreach (var kvp in addressDictionary)
-        //    {
-        //        var blockNumbers = kvp.Value.ToImmutableSortedSet();
+        // private void WriteBatchToFile()
+        // {
+        //     foreach (var kvp in addressDictionary)
+        //     {
+        //         var blockNumbers = kvp.Value.ToImmutableSortedSet();
+        //
+        //         var filePath = GetPath(kvp);
+        //
+        //         var fileLock = fileLocks.GetOrAdd(filePath, new object());
+        //
+        //         lock (fileLock)
+        //         {
+        //             using var fileStream = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read);
+        //             using var writer = new BinaryWriter(fileStream);
+        //             foreach (var blockNumber in blockNumbers)
+        //             {
+        //                 writer.Write((int)blockNumber);
+        //             }
+        //         }
+        //     }
+        // }
 
-        //        var keyAsString = kvp.Key.ToString();
+        private string GetPath(Span<byte> key)
+        {
+            var keyAsString = key.ToHexString(false, true, false);
 
-        //        var trimmed = keyAsString.AsSpan().Slice(2).TrimStart("0");
-        //        var subfolder = trimmed.Length == 0 ? "0" : trimmed[0].ToString();
-        //        string subfolderPath = Path.Combine(rootDirectory, subfolder);
-        //        string filePath = Path.Combine(subfolderPath, keyAsString);
+            // Ensure the keyAsString has at least 3 characters by padding with '0' if necessary
+            if (keyAsString.Length < 3)
+            {
+                keyAsString = keyAsString.PadLeft(3, '0');
+            }
 
-        //        var fileLock = fileLocks.GetOrAdd(filePath, new object());
+            // Extract the first three characters
+            string subfolder1 = keyAsString[0].ToString();
+            string subfolder2 = keyAsString[1].ToString();
+            string subfolder3 = keyAsString[2].ToString();
 
-        //        lock (fileLock)
-        //        {
-        //            using var fileStream = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read);
-        //            using var writer = new BinaryWriter(fileStream);
-        //            foreach (var blockNumber in blockNumbers)
-        //            {
-        //                writer.Write((int)blockNumber);
-        //            }
-        //        }
-        //    }
-        //}
+            // Combine the root directory with the subfolders and the key string to form the full path
+            return Path.Combine(rootDirectory, subfolder1, subfolder2, subfolder3, key.ToHexString(false,false,false));
+        }
 
         private IEnumerable<(long, Hash256)> GetBlockBodiesForMigration(CancellationToken token)
         {
@@ -327,7 +419,7 @@ namespace Nethermind.Init.Steps.Migrations
 
             totalBlocks = _blockTree.BestKnownNumber;
 
-            for (long i = _blockTree.BestKnownNumber - 1; i > 0; i--)
+            for (long i = 0; i < _blockTree.BestKnownNumber - 1; i++)
             {
                 if (token.IsCancellationRequested)
                 {
